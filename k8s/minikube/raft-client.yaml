@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raft-client
+  namespace: raft
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: raft-client
+  template:
+    metadata:
+      labels:
+        app: raft-client
+    spec:
+      containers:
+        - name: client
+          image: raft-grpc:local
+          imagePullPolicy: IfNotPresent
+          command: ["java"]
+          args:
+            - "-Xms64m"
+            - "-Xmx256m"
+            - "-Djava.net.preferIPv4Stack=true"
+            - "-Djava.util.logging.SimpleFormatter.format=[%1$tT] %4$s %2$s: %5$s%n"
+            - "-cp"
+            - "/app/app.jar"
+            - "raft.ClientMain"
+          env:
+            - name: NODES
+              value: "1:node1:50051,2:node2:50052,3:node3:50053"
+            - name: PERIOD_SECONDS
+              value: "5"

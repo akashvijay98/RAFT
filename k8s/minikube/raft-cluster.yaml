@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: raft
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node1
+  namespace: raft
+spec:
+  selector:
+    app: raft
+    node-id: "1"
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raft-node1
+  namespace: raft
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: raft
+      node-id: "1"
+  template:
+    metadata:
+      labels:
+        app: raft
+        node-id: "1"
+    spec:
+      containers:
+        - name: node
+          image: raft-grpc:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: NODE_ID
+              value: "1"
+            - name: NODE_PORT
+              value: "50051"
+            - name: PEERS
+              value: "2:node2:50052,3:node3:50053"
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node2
+  namespace: raft
+spec:
+  selector:
+    app: raft
+    node-id: "2"
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: 50052
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raft-node2
+  namespace: raft
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: raft
+      node-id: "2"
+  template:
+    metadata:
+      labels:
+        app: raft
+        node-id: "2"
+    spec:
+      containers:
+        - name: node
+          image: raft-grpc:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50052
+              name: grpc
+          env:
+            - name: NODE_ID
+              value: "2"
+            - name: NODE_PORT
+              value: "50052"
+            - name: PEERS
+              value: "1:node1:50051,3:node3:50053"
+          readinessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 50052
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node3
+  namespace: raft
+spec:
+  selector:
+    app: raft
+    node-id: "3"
+  ports:
+    - name: grpc
+      port: 50053
+      targetPort: 50053
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raft-node3
+  namespace: raft
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: raft
+      node-id: "3"
+  template:
+    metadata:
+      labels:
+        app: raft
+        node-id: "3"
+    spec:
+      containers:
+        - name: node
+          image: raft-grpc:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50053
+              name: grpc
+          env:
+            - name: NODE_ID
+              value: "3"
+            - name: NODE_PORT
+              value: "50053"
+            - name: PEERS
+              value: "1:node1:50051,2:node2:50052"
+          readinessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 10
+            periodSeconds: 10

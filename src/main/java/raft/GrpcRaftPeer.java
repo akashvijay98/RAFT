@@ -1,88 +1,95 @@
 package raft;
 
 import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
-import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
-import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioSocketChannel;
 import raft.grpc.AppendEntriesRequest;
 import raft.grpc.AppendEntriesResponse;
 import raft.grpc.RaftServiceGrpc;
 
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
-public class GrpcRaftPeer implements RaftPeer{
+public class GrpcRaftPeer implements RaftPeer {
     private static final Logger log = Logger.getLogger(GrpcRaftPeer.class.getName());
 
     private static final int RPC_DEADLINE_MS = 5000;
+    private static final int PROBE_DEADLINE_MS = 500;
+    private static final long MIN_CHANNEL_RESET_INTERVAL_MS = 2_000;
 
     private final int peerId;
-    private final ManagedChannel channel;
-    private  final RaftServiceGrpc.RaftServiceBlockingStub stub;
     private final String host;
     private final int port;
 
-    public GrpcRaftPeer(int peerId, String host, int port){
+    private volatile ManagedChannel channel;
+    private volatile RaftServiceGrpc.RaftServiceBlockingStub stub;
+    private volatile long lastChannelResetAtMs = 0;
+
+    public GrpcRaftPeer(int peerId, String host, int port) {
         this.peerId = peerId;
         this.host = host;
         this.port = port;
 
-        String resolvedIp;
-        try {
-            // Force IPv4 - get all addresses and pick the IPv4 one
-            InetAddress[] addresses = InetAddress.getAllByName(host);
-
-            String ipv4 = null;
-            for (InetAddress addr : addresses) {
-                log.info("DNS result for " + host + ": " + addr.getHostAddress()
-                        + " type: " + addr.getClass().getSimpleName());
-                if (addr instanceof java.net.Inet4Address) {
-                    ipv4 = addr.getHostAddress();
-                    break;
-                }
-            }
-            resolvedIp = (ipv4 != null) ? ipv4 : addresses[0].getHostAddress();
-            log.info("GrpcRaftPeer resolved " + host + " -> " + resolvedIp);
-        } catch (Exception e) {
-            log.warning("DNS resolution failed for " + host + ": " + e.getMessage());
-            resolvedIp = host;
-        }
-
-        NioEventLoopGroup group = new NioEventLoopGroup();
-        log.info("GrpcRaftPeer creating channel to: [" + resolvedIp + "] port: " + port
-                + " class: " + resolvedIp.getClass().getName());
-
-        // Replace the channel creation with this
-        java.net.InetSocketAddress socketAddress = new java.net.InetSocketAddress(resolvedIp, port);
-        log.info("Socket address: " + socketAddress + " isUnresolved: " + socketAddress.isUnresolved());
-
-        this.channel = NettyChannelBuilder
-                .forAddress(socketAddress)   // pass InetSocketAddress, not String
-                .channelType(NioSocketChannel.class)
-                .eventLoopGroup(group)
-                .usePlaintext()
-                .build();
-
-        this.stub = RaftServiceGrpc.newBlockingStub(channel);
-        log.info("GrpcRaftPeer created → " + host + ":" + port + " (peer " + peerId + ")");
-
+        resetChannel("init");
     }
 
     @Override
-    public int peerId() { return peerId; }
+    public int peerId() {
+        return peerId;
+    }
 
+    private static String resolveIpv4OrFirst(String hostname) throws Exception {
+        InetAddress[] addresses = InetAddress.getAllByName(hostname);
+        for (InetAddress addr : addresses) {
+            if (addr instanceof java.net.Inet4Address) {
+                return addr.getHostAddress();
+            }
+        }
+        return addresses[0].getHostAddress();
+    }
 
-    // ── RequestVote from a Peer node
-    private static final int PROBE_DEADLINE_MS = 500;
+    private synchronized void resetChannel(String reason) {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastChannelResetAtMs < MIN_CHANNEL_RESET_INTERVAL_MS) {
+            return;
+        }
+        lastChannelResetAtMs = nowMs;
+
+        ManagedChannel old = this.channel;
+        if (old != null) {
+            old.shutdownNow();
+        }
+
+        String resolved;
+        try {
+            resolved = resolveIpv4OrFirst(host);
+        } catch (Exception ex) {
+            // If DNS fails, keep the raw host. (It will fail fast and we'll retry on the next reset.)
+            resolved = host;
+        }
+
+        // Use a resolved InetSocketAddress (IP) so Netty doesn't attempt to connect with an
+        // unresolved address (which can surface as "Invalid argument: /host:port").
+        InetSocketAddress remote = new InetSocketAddress(resolved, port);
+
+        this.channel = NettyChannelBuilder
+                .forAddress(remote)
+                .usePlaintext()
+                .build();
+        this.stub = RaftServiceGrpc.newBlockingStub(channel);
+
+        log.info("GrpcRaftPeer channel reset -> " + host + ":" + port + " (peer " + peerId + ", resolved=" + resolved + ", reason=" + reason + ")");
+    }
+
+    private static boolean shouldResetChannel(StatusRuntimeException e) {
+        return e.getStatus().getCode() == io.grpc.Status.Code.UNAVAILABLE;
+    }
 
     @Override
-    public VoteResponse requestVote(int term, int candidateId, int lastLogIndex,
-                                    int lastLogTerm) throws Exception {
+    public VoteResponse requestVote(int term, int candidateId, int lastLogIndex, int lastLogTerm) throws Exception {
         raft.grpc.VoteRequest req = raft.grpc.VoteRequest.newBuilder()
                 .setTerm(term)
                 .setCandidateId(candidateId)
@@ -90,31 +97,31 @@ public class GrpcRaftPeer implements RaftPeer{
                 .setLastLogTerm(lastLogTerm)
                 .build();
 
-        long deadline = (term == 0) ? PROBE_DEADLINE_MS : RPC_DEADLINE_MS;
+        long deadlineMs = (term == 0) ? PROBE_DEADLINE_MS : RPC_DEADLINE_MS;
 
         try {
             raft.grpc.VoteResponse resp = stub
-                    .withDeadlineAfter(deadline, TimeUnit.MILLISECONDS)
+                    .withDeadlineAfter(deadlineMs, TimeUnit.MILLISECONDS)
                     .requestVote(req);
             return new VoteResponse(resp.getTerm(), resp.getGranted());
 
         } catch (StatusRuntimeException e) {
-            log.warning("[GrpcRaftPeer] Full exception for peer " + peerId + ": " + e.getStatus());
-            if (e.getCause() != null) {
-                log.warning("[GrpcRaftPeer] Caused by: " + e.getCause());
-                if (e.getCause().getCause() != null) {
-                    log.warning("[GrpcRaftPeer] Root cause: " + e.getCause().getCause());
-                }
+            if (shouldResetChannel(e)) {
+                resetChannel("requestVote:" + e.getStatus().getCode());
             }
-            e.printStackTrace();
+            log.warning("[GrpcRaftPeer] requestVote to peer " + peerId + " failed: " + e.getStatus());
             throw e;
         }
     }
 
-    // ── AppendEntries to a PeerNode
-    public AppendResponse appendEntries(int term, int leaderId,
-                                        int prevLogIndex, int prevLogTerm,
-                                        List<LogEntry> entries, int leaderCommit) throws Exception {
+    public AppendResponse appendEntries(
+            int term,
+            int leaderId,
+            int prevLogIndex,
+            int prevLogTerm,
+            List<LogEntry> entries,
+            int leaderCommit
+    ) throws Exception {
 
         try {
             AppendEntriesRequest.Builder builder = AppendEntriesRequest.newBuilder()
@@ -137,19 +144,27 @@ public class GrpcRaftPeer implements RaftPeer{
 
             return new AppendResponse(resp.getTerm(), resp.getSuccess());
 
-
         } catch (StatusRuntimeException e) {
+            if (shouldResetChannel(e)) {
+                resetChannel("appendEntries:" + e.getStatus().getCode());
+            }
             log.warning("AppendEntries to peer " + peerId + " failed: " + e.getStatus());
             throw e;
         }
-
     }
 
-
-    // channel shutdown
     public void shutdown() throws InterruptedException {
-        channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+        ManagedChannel ch = channel;
+        if (ch != null) {
+            ch.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+        }
     }
-    public String getHost() { return host; }
-    public int getPort() { return port; }
+
+    public String getHost() {
+        return host;
+    }
+
+    public int getPort() {
+        return port;
+    }
 }
